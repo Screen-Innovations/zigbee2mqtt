@@ -1,6 +1,7 @@
 // biome-ignore assist/source/organizeImports: import mocks first
 import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
 import type {Eui64} from "zigbee-herdsman/dist/zspec/tstypes";
+import type {LQITableEntry, RoutingTableEntry} from "zigbee-herdsman/dist/zspec/zdo/definition/tstypes";
 import * as data from "../mocks/data";
 import {mockLogger} from "../mocks/logger";
 import {events as mockMQTTEvents, mockMQTTPublishAsync} from "../mocks/mqtt";
@@ -13,6 +14,8 @@ import path from "node:path";
 import {stringify} from "../../lib/util/stringify";
 import {Controller} from "../../lib/controller";
 import * as settings from "../../lib/util/settings";
+import type {Zigbee2MQTTNetworkMap} from "../../lib/types/api";
+import utils from "../../lib/util/utils";
 
 returnDevices.push(
     devices.coordinator.ieeeAddr,
@@ -40,6 +43,20 @@ const ROUTING_BASE_RSP = {
     manyToOne: 0,
     routeRecordRequired: 0,
     reserved1: 0,
+};
+
+// Keep the existing strict output fixtures as a compatibility check; the added
+// raw evidence fields are checked separately below.
+const legacyRawResponse = <T extends {data: {value: Zigbee2MQTTNetworkMap}}>(response: T): T => {
+    const legacy = structuredClone(response);
+    delete legacy.data.value.scan;
+    for (const node of legacy.data.value.nodes) {
+        delete node.neighborTable;
+        delete node.routingTable;
+        delete node.lqiRead;
+        delete node.routingTableRead;
+    }
+    return legacy;
 };
 
 describe("Extension: NetworkMap", () => {
@@ -362,7 +379,7 @@ describe("Extension: NetworkMap", () => {
             status: "ok",
         };
         const actual = JSON.parse(mockMQTTPublishAsync.mock.calls[0][1]);
-        expect(actual).toStrictEqual(expected);
+        expect(legacyRawResponse(actual)).toStrictEqual(expected);
     });
 
     it("Output graphviz networkmap", async () => {
@@ -692,7 +709,7 @@ describe("Extension: NetworkMap", () => {
             status: "ok",
         };
         const actual = JSON.parse(mockMQTTPublishAsync.mock.calls[0][1]);
-        expect(actual).toStrictEqual(expected);
+        expect(legacyRawResponse(actual)).toStrictEqual(expected);
     });
 
     it("Handles retrying request when first attempt fails", async () => {
@@ -861,6 +878,137 @@ describe("Extension: NetworkMap", () => {
             status: "ok",
         };
         const actual = JSON.parse(mockMQTTPublishAsync.mock.calls[0][1]);
-        expect(actual).toStrictEqual(expected);
+        expect(legacyRawResponse(actual)).toStrictEqual(expected);
+    });
+
+    describe("Raw scan evidence", () => {
+        beforeEach(() => {
+            settings.set(["devices", devices.bulb.ieeeAddr, "disabled"], false);
+            for (const device of Object.values(devices)) {
+                device.lqi.mockReset().mockResolvedValue([]);
+                device.routingTable.mockReset().mockResolvedValue([]);
+            }
+        });
+
+        afterEach(() => {
+            vi.mocked(Date.now).mockReturnValue(10000);
+            mockSleep.mock();
+        });
+
+        const readMap = async (routes: boolean): Promise<Zigbee2MQTTNetworkMap> => {
+            mockMQTTEvents.message("zigbee2mqtt/bridge/request/networkmap", stringify({type: "raw", routes}));
+            await flushPromises();
+            expect(mockMQTTPublishAsync).toHaveBeenCalledTimes(1);
+            return JSON.parse(mockMQTTPublishAsync.mock.calls[0][1]).data.value;
+        };
+
+        it("Preserves full tables before link filtering or IEEE correction", async () => {
+            const neighborTable: LQITableEntry[] = [
+                {eui64: "0x0000000000000000", nwkAddress: devices.bulb.networkAddress, relationship: 2, depth: 1, lqi: 120, ...LQI_BASE_RSP},
+                {
+                    eui64: devices.bulb_color.ieeeAddr as Eui64,
+                    nwkAddress: devices.bulb_color.networkAddress,
+                    relationship: 4,
+                    depth: 1,
+                    lqi: 10,
+                    ...LQI_BASE_RSP,
+                },
+            ];
+            const routingTable: RoutingTableEntry[] = [
+                {destinationAddress: 1, nextHopAddress: devices.bulb.networkAddress, status: "ACTIVE", ...ROUTING_BASE_RSP},
+                {destinationAddress: 2, nextHopAddress: devices.bulb_color.networkAddress, status: "INACTIVE", ...ROUTING_BASE_RSP},
+                {destinationAddress: 3, nextHopAddress: 0xabcd, status: "DISCOVERY_FAILED", ...ROUTING_BASE_RSP},
+            ];
+            devices.coordinator.lqi.mockResolvedValueOnce(neighborTable);
+            devices.coordinator.routingTable.mockResolvedValueOnce(routingTable);
+
+            const map = await readMap(true);
+            const coordinator = map.nodes.find((node) => node.type === "Coordinator");
+            expect(coordinator.neighborTable).toStrictEqual(neighborTable);
+            expect(coordinator.routingTable).toStrictEqual(routingTable);
+            expect(coordinator.lqiRead).toStrictEqual({startedAt: 10000, completedAt: 10000, attempts: 1, status: "success"});
+            expect(coordinator.routingTableRead).toStrictEqual(coordinator.lqiRead);
+            expect(map.scan).toStrictEqual({startedAt: 10000, completedAt: 10000});
+            expect(map.links).toHaveLength(1);
+            expect(map.links[0].source.ieeeAddr).toBe(devices.bulb.ieeeAddr);
+            expect(map.links[0].routes).toStrictEqual([routingTable[0]]);
+            expect(neighborTable[0].eui64).toBe("0x0000000000000000");
+            expect(devices.coordinator.lqi).toHaveBeenCalledTimes(1);
+            expect(devices.coordinator.routingTable).toHaveBeenCalledTimes(1);
+        });
+
+        it("Retains routing data when the neighbor read fails and distinguishes failed from empty tables", async () => {
+            const routingTable: RoutingTableEntry[] = [{destinationAddress: 1, nextHopAddress: 2, status: "ACTIVE", ...ROUTING_BASE_RSP}];
+            devices.coordinator.lqi.mockRejectedValueOnce("failed").mockRejectedValueOnce("failed again");
+            devices.coordinator.routingTable.mockResolvedValueOnce(routingTable);
+            devices.bulb.routingTable.mockRejectedValueOnce("failed").mockRejectedValueOnce("failed again");
+
+            const map = await readMap(true);
+            const coordinator = map.nodes.find((node) => node.type === "Coordinator");
+            const bulb = map.nodes.find((node) => node.ieeeAddr === devices.bulb.ieeeAddr);
+            expect(coordinator.neighborTable).toBeUndefined();
+            expect(coordinator.routingTable).toStrictEqual(routingTable);
+            expect(coordinator.failed).toStrictEqual(["lqi"]);
+            expect(coordinator.lqiRead).toStrictEqual({startedAt: 10000, completedAt: 10000, attempts: 2, status: "failed"});
+            expect(coordinator.routingTableRead.status).toBe("success");
+            expect(bulb.neighborTable).toStrictEqual([]);
+            expect(bulb.lqiRead.status).toBe("success");
+            expect(bulb.routingTable).toBeUndefined();
+            expect(bulb.routingTableRead).toStrictEqual({startedAt: 10000, completedAt: 10000, attempts: 2, status: "failed"});
+            expect(map.links).toStrictEqual([]);
+        });
+
+        it("Omits unrequested routing reads and does not query end devices or disabled devices", async () => {
+            settings.set(["devices", devices.bulb.ieeeAddr, "disabled"], true);
+            const map = await readMap(false);
+            expect(map.nodes.some((node) => node.ieeeAddr === devices.bulb.ieeeAddr)).toBe(false);
+            expect(devices.bulb.lqi).not.toHaveBeenCalled();
+            for (const device of Object.values(devices)) expect(device.routingTable).not.toHaveBeenCalled();
+            for (const node of map.nodes) {
+                expect(node.routingTable).toBeUndefined();
+                expect(node.routingTableRead).toBeUndefined();
+                if (node.type === "EndDevice") {
+                    expect(node.neighborTable).toBeUndefined();
+                    expect(node.lqiRead).toBeUndefined();
+                } else {
+                    expect(node.neighborTable).toStrictEqual([]);
+                    expect(node.lqiRead.status).toBe("success");
+                }
+            }
+            expect(devices.WXKG02LM_rev1.lqi).not.toHaveBeenCalled();
+            expect(devices.external_converter_device.lqi).not.toHaveBeenCalled();
+        });
+
+        it("Measures table read windows across retries without counting pagination as attempts", async () => {
+            let clock = 10000;
+            vi.mocked(Date.now).mockImplementation(() => clock);
+            vi.spyOn(utils, "sleep").mockImplementation((seconds) => {
+                clock += seconds * 1000;
+                return Promise.resolve();
+            });
+            devices.coordinator.lqi
+                .mockImplementationOnce(() => {
+                    clock += 250;
+                    return Promise.reject(new Error("first read failed"));
+                })
+                .mockImplementationOnce(() => {
+                    clock += 400;
+                    return Promise.resolve([]);
+                });
+            devices.coordinator.routingTable.mockImplementationOnce(() => {
+                clock += 50;
+                return Promise.resolve([]);
+            });
+            const map = await readMap(true);
+            const coordinator = map.nodes.find((node) => node.type === "Coordinator");
+            expect(coordinator.neighborTable).toStrictEqual([]);
+            expect(coordinator.routingTable).toStrictEqual([]);
+            expect(coordinator.lqiRead).toStrictEqual({startedAt: 11000, completedAt: 16650, attempts: 2, status: "success"});
+            expect(coordinator.routingTableRead).toStrictEqual({startedAt: 16650, completedAt: 16700, attempts: 1, status: "success"});
+            expect(map.scan).toStrictEqual({startedAt: 10000, completedAt: clock});
+            expect(clock).toBeGreaterThan(16700);
+            expect(devices.coordinator.lqi).toHaveBeenCalledTimes(2);
+            expect(devices.coordinator.routingTable).toHaveBeenCalledTimes(1);
+        });
     });
 });

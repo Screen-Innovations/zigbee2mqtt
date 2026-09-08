@@ -1,7 +1,7 @@
 import bind from "bind-decorator";
 import type {Eui64} from "zigbee-herdsman/dist/zspec/tstypes";
 import type {LQITableEntry, RoutingTableEntry} from "zigbee-herdsman/dist/zspec/zdo/definition/tstypes";
-import type {Zigbee2MQTTAPI, Zigbee2MQTTNetworkMap} from "../types/api";
+import type {Zigbee2MQTTAPI, Zigbee2MQTTNetworkMap, Zigbee2MQTTNetworkMapRead} from "../types/api";
 import logger from "../util/logger";
 import * as settings from "../util/settings";
 import {stringify} from "../util/stringify";
@@ -187,19 +187,32 @@ export default class NetworkMap extends Extension {
     }
 
     async networkScan(includeRoutes: boolean): Promise<Zigbee2MQTTNetworkMap> {
+        const startedAt = Date.now();
         logger.info(`Starting network scan (includeRoutes '${includeRoutes}')`);
         const lqis = new Map<Device, LQITableEntry[]>();
         const routingTables = new Map<Device, RoutingTableEntry[]>();
+        const lqiReads = new Map<Device, Zigbee2MQTTNetworkMapRead>();
+        const routingTableReads = new Map<Device, Zigbee2MQTTNetworkMapRead>();
         const failed = new Map<Device, string[]>();
-        const requestWithRetry = async <T>(request: () => Promise<T>): Promise<T> => {
+        const requestWithRetry = async <T>(request: () => Promise<T>, reads: Map<Device, Zigbee2MQTTNetworkMapRead>, device: Device): Promise<T> => {
+            const readStartedAt = Date.now();
+            let attempts = 1;
+            let status: Zigbee2MQTTNetworkMapRead["status"] = "failed";
             try {
-                const result = await request();
+                let result: T;
+                try {
+                    result = await request();
+                } catch {
+                    // Network is possibly congested, sleep 5 seconds to let the network settle.
+                    await utils.sleep(5);
+                    attempts++;
+                    result = await request();
+                }
 
+                status = "success";
                 return result;
-            } catch {
-                // Network is possibly congested, sleep 5 seconds to let the network settle.
-                await utils.sleep(5);
-                return await request();
+            } finally {
+                reads.set(device, {startedAt: readStartedAt, completedAt: Date.now(), attempts, status});
             }
         };
 
@@ -213,7 +226,7 @@ export default class NetworkMap extends Extension {
             await utils.sleep(1); // sleep 1 second between each scan to reduce stress on network.
 
             try {
-                const result = await requestWithRetry<LQITableEntry[]>(async () => await device.zh.lqi());
+                const result = await requestWithRetry<LQITableEntry[]>(async () => await device.zh.lqi(), lqiReads, device);
                 lqis.set(device, result);
                 logger.debug(`LQI succeeded for '${device.name}'`);
             } catch (error) {
@@ -227,7 +240,7 @@ export default class NetworkMap extends Extension {
             if (includeRoutes) {
                 /* v8 ignore stop */
                 try {
-                    const result = await requestWithRetry<RoutingTableEntry[]>(async () => await device.zh.routingTable());
+                    const result = await requestWithRetry<RoutingTableEntry[]>(async () => await device.zh.routingTable(), routingTableReads, device);
                     routingTables.set(device, result);
                     logger.debug(`Routing table succeeded for '${device.name}'`);
                 } catch (error) {
@@ -241,7 +254,7 @@ export default class NetworkMap extends Extension {
 
         logger.info("Network scan finished");
 
-        const topology: Zigbee2MQTTNetworkMap = {nodes: [], links: []};
+        const topology: Zigbee2MQTTNetworkMap = {nodes: [], links: [], scan: {startedAt, completedAt: Date.now()}};
 
         // XXX: display GP/disabled devices in the map, better feedback than just hiding them?
         for (const device of this.zigbee.devicesIterator((d) => d.type !== "GreenPower")) {
@@ -273,6 +286,10 @@ export default class NetworkMap extends Extension {
                 manufacturerName: device.zh.manufacturerName,
                 modelID: device.zh.modelID,
                 failed: failed.get(device),
+                neighborTable: lqis.get(device),
+                routingTable: routingTables.get(device),
+                lqiRead: lqiReads.get(device),
+                routingTableRead: routingTableReads.get(device),
                 lastSeen: device.zh.lastSeen,
                 definition,
             });

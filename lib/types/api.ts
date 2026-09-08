@@ -2,7 +2,7 @@ import type * as zigbeeHerdsman from "zigbee-herdsman/dist";
 import type {ZclPayload} from "zigbee-herdsman/dist/adapter/events";
 import type {Eui64} from "zigbee-herdsman/dist/zspec/tstypes";
 import type {Cluster, ClusterName, CustomClusters} from "zigbee-herdsman/dist/zspec/zcl/definition/tstype";
-import type {GenericZdoResponse, RoutingTableEntry} from "zigbee-herdsman/dist/zspec/zdo/definition/tstypes";
+import type {GenericZdoResponse, LQITableEntry, RoutingTableEntry} from "zigbee-herdsman/dist/zspec/zdo/definition/tstypes";
 import type * as zigbeeHerdsmanConverter from "zigbee-herdsman-converters";
 import type {Base} from "zigbee-herdsman-converters/lib/exposes";
 
@@ -299,7 +299,18 @@ export interface Zigbee2MQTTGroup {
     members: Zigbee2MQTTGroupMember[];
 }
 
+export interface Zigbee2MQTTNetworkMapRead {
+    /** Unix timestamps in milliseconds, covering pagination and any retry delay. Not radio measurement times. */
+    startedAt: number;
+    completedAt: number;
+    /** Calls to herdsman's table reader, not individual paginated Zigbee requests. */
+    attempts: number;
+    status: "success" | "failed";
+}
+
 export interface Zigbee2MQTTNetworkMap {
+    /** The sequential scan's Unix time window in milliseconds; entries are not simultaneous observations. */
+    scan?: {startedAt: number; completedAt: number};
     nodes: {
         ieeeAddr: string;
         friendlyName: string;
@@ -308,6 +319,12 @@ export interface Zigbee2MQTTNetworkMap {
         manufacturerName?: string;
         modelID?: string;
         failed?: string[];
+        /** Complete unmodified ZDO table, before graph filtering and IEEE-address correction. Absent on failure or when not queried. */
+        neighborTable?: LQITableEntry[];
+        /** Complete ZDO table, including routes without a matching graph link. An empty array means the read succeeded. */
+        routingTable?: RoutingTableEntry[];
+        lqiRead?: Zigbee2MQTTNetworkMapRead;
+        routingTableRead?: Zigbee2MQTTNetworkMapRead;
         lastSeen?: number;
         definition?: {model: string; vendor: string; supports: string; description: string};
     }[];
