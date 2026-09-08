@@ -2402,6 +2402,30 @@ describe("Extension: Bridge", () => {
         );
     });
 
+    it.each([
+        {profileID: 0x0104, deviceID: 0x0203},
+        {profileID: 0xc05e, deviceID: 0x0820},
+        {profileID: 0, deviceID: 0},
+    ])("Should publish endpoint descriptor IDs: $profileID / $deviceID", async ({profileID, deviceID}) => {
+        const endpoint = devices.remote.getEndpoint(1)!;
+        const original = {profileID: endpoint.profileID, deviceID: endpoint.deviceID};
+        endpoint.profileID = profileID;
+        endpoint.deviceID = deviceID;
+
+        try {
+            await extension.publishDevices();
+            const message = mockMQTTPublishAsync.mock.calls.find((call) => call[0] === "zigbee2mqtt/bridge/devices")!;
+            const publishedDevices = JSON.parse(message[1]);
+            const remote = publishedDevices.find((device: {ieee_address: string}) => device.ieee_address === devices.remote.ieeeAddr);
+            expect(remote.endpoints[1]).toMatchObject({profile_id: profileID, device_id: deviceID});
+            expect(remote.endpoints[2]).not.toHaveProperty("profile_id");
+            expect(remote.endpoints[2]).not.toHaveProperty("device_id");
+        } finally {
+            endpoint.profileID = original.profileID;
+            endpoint.deviceID = original.deviceID;
+        }
+    });
+
     it("Should publish definitions on startup", async () => {
         await resetExtension();
         expect(mockMQTTPublishAsync).toHaveBeenCalledWith("zigbee2mqtt/bridge/definitions", expect.stringContaining(stringify(CUSTOM_CLUSTERS)), {

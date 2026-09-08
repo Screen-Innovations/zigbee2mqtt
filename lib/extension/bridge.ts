@@ -835,6 +835,8 @@ export default class Bridge extends Extension {
             for (const endpoint of device.zh.endpoints) {
                 const data: (typeof endpoints)[keyof typeof endpoints] = {
                     name: device.endpointName(endpoint),
+                    profile_id: endpoint.profileID,
+                    device_id: endpoint.deviceID,
                     scenes: utils.getScenes(endpoint),
                     bindings: [],
                     configured_reportings: [],
