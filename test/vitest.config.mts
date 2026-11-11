@@ -9,8 +9,7 @@ export default defineConfig({
         coverage: {
             enabled: false,
             provider: "v8",
-            include: ["lib/**"],
-            extension: [".ts"],
+            include: ["lib/**/*.ts"],
             // exclude: [],
             clean: true,
             cleanOnRerun: true,
